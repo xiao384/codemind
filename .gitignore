@@ -1,0 +1,64 @@
+# ═══════════════ 敏感信息（绝不提交）═══════════════
+.secrets/
+.aliyun_cred
+.ms_state.json
+.env
+*.key
+*.pem
+token.txt
+ms_token.txt
+
+# ═══════════════ 临时垃圾 ═══════════════
+cb2_*/
+py-test/
+btmb/
+tools/_*.py
+tools/_*.txt
+tools/c*.txt
+
+# 浏览器 profile（含登录 cookie）
+.browser_profile/
+.browser_profile_test/
+
+# ═══════════════ 大数据（几十 GB）═══════════════
+data/
+corpora/
+runs/
+models/
+pkg_amd/
+pkg_amd/
+cloud/
+ailyun/
+*.zip
+*.7z
+*.tar.gz
+*.bin
+*.npy
+*.npz
+*.pt
+*.safetensors
+
+# ═══════════════ 虚拟环境 / 浏览器 ═══════════════
+.venv/
+venv/
+.playwright_browsers/
+
+# ═══════════════ 缓存与临时 ═══════════════
+.tmp/
+.hf/
+.modelscope/
+.home/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+pytest-of-*/
+nohup.out
+.codemind_selftest/
+.codemind_backup/
+
+# ═══════════════ IDE ═══════════════
+.idea/
+.vscode/
