@@ -501,3 +501,86 @@ def test_dropout_active_in_train_mode(cfg: ModelConfig):
         a, _, _ = m(x)
         b, _, _ = m(x)
     assert not torch.allclose(a, b), "训练模式下 dropout 应当生效"
+
+
+# ═══════════════ 梯度检查点（grad_checkpoint）═══════════════
+#
+# 这个开关的作用是「用计算换显存」，判据有两条：
+#   1. **数值必须等价** —— 开与不开，loss 和梯度必须一致（否则训练语义变了）
+#   2. **只在训练模式生效** —— 生成/评估路径绝不能用（拿不到 cache，且白慢）
+#
+# 2026-11 实测背景：1B + ctx 1024 + batch 16 的激活约 50 GB，开检查点后约 12 GB。
+# 这是「32 GB 双 T4 上能否装下 1B 训练」的决定性开关。
+
+
+def test_grad_checkpoint_matches_plain_forward(cfg: ModelConfig) -> None:
+    """开/不开梯度检查点，loss 与梯度必须一致。"""
+    torch.manual_seed(1234)
+    model = GPT(cfg)
+    idx = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))
+    tgt = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))
+
+    model.train()
+    model.zero_grad(set_to_none=True)
+    _, loss_plain, _ = model(idx, tgt, logits_for_all=False, grad_checkpoint=False)
+    loss_plain.backward()
+    grads_plain = {
+        n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None
+    }
+
+    model.zero_grad(set_to_none=True)
+    _, loss_ckpt, _ = model(idx, tgt, logits_for_all=False, grad_checkpoint=True)
+    loss_ckpt.backward()
+    grads_ckpt = {
+        n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None
+    }
+
+    assert float(loss_ckpt.detach()) == pytest.approx(float(loss_plain.detach()), rel=0, abs=1e-6)
+    assert set(grads_plain) == set(grads_ckpt)
+    assert grads_plain, "没有任何梯度，测试无意义"
+    for name in grads_plain:
+        assert torch.allclose(grads_plain[name], grads_ckpt[name], atol=1e-6), name
+
+
+def test_grad_checkpoint_disabled_in_eval_mode(cfg: ModelConfig) -> None:
+    """eval 模式下即使传 grad_checkpoint=True 也不能走检查点路径。
+
+    关闭 dropout 后，训练模式与 eval 模式的前向应当一致。
+    """
+    torch.manual_seed(99)
+    cfg0 = ModelConfig(
+        vocab_size=cfg.vocab_size,
+        n_layer=cfg.n_layer,
+        n_head=cfg.n_head,
+        n_embd=cfg.n_embd,
+        n_kv_head=cfg.n_kv_head,
+        block_size=cfg.block_size,
+        dropout=0.0,
+    )
+    model = GPT(cfg0)
+    idx = torch.randint(0, cfg0.vocab_size, (2, cfg0.block_size))
+    tgt = torch.randint(0, cfg0.vocab_size, (2, cfg0.block_size))
+
+    model.train()
+    _, loss_train, _ = model(idx, tgt, logits_for_all=False, grad_checkpoint=True)
+
+    model.eval()
+    with torch.no_grad():
+        _, loss_eval, _ = model(idx, tgt, logits_for_all=False, grad_checkpoint=True)
+
+    assert float(loss_eval) == pytest.approx(float(loss_train), rel=0, abs=1e-6)
+
+
+def test_grad_checkpoint_skipped_when_cache_used(cfg: ModelConfig) -> None:
+    """use_cache=True 时必须退回普通路径 —— 检查点拿不到 KV cache。"""
+    model = GPT(cfg)
+    model.train()
+    idx = torch.randint(0, cfg.vocab_size, (1, 4))
+    tgt = torch.randint(0, cfg.vocab_size, (1, 4))
+    _, loss, aux = model(
+        idx, tgt, use_cache=True, logits_for_all=False, grad_checkpoint=True
+    )
+    assert loss is not None
+    # KW-Cache 必须真的产出了（n_layer 个），说明没走检查点分支
+    caches = aux.get("caches") if isinstance(aux, dict) else None
+    assert caches is not None and len(caches) == cfg.n_layer

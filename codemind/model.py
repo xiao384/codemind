@@ -224,6 +224,22 @@ class Block(nn.Module):
 # ======================================================================================
 
 
+def _block_core(
+    block: "Block",
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """只返回 hidden state 的 block 调用，供 ``torch.utils.checkpoint`` 使用。
+
+    ``Block.forward`` 返回 ``(x, attn_weights, cache)`` 三元组，而梯度检查点要求
+    函数返回值参与反向图。这里包一层只取第一个元素 —— 检查点模式下不需要
+    注意力图和 KV cache（训练路径两个都是 None/False）。
+    """
+    out, _attn, _cache = block(x, cos, sin, None, False, False)
+    return out
+
+
 class GPT(nn.Module):
     """从零实现的代码语言模型。
 
@@ -288,6 +304,7 @@ class GPT(nn.Module):
         return_attn: bool = False,
         logits_for_all: bool = True,
         ignore_index: int = -100,
+        grad_checkpoint: bool = False,
     ):
         """前向计算。
 
@@ -321,11 +338,28 @@ class GPT(nn.Module):
         x = self.drop(self.tok_emb(idx))
         new_caches: List[Tuple[torch.Tensor, torch.Tensor]] = []
         attn_maps: List[torch.Tensor] = []
+        # 梯度检查点：用计算换显存。只在**训练 + 无 cache + 不取注意力图**时启用
+        # （生成/评估路径绝不能用，否则既慢又拿不到 cache）。
+        # 实测意义：1B + ctx 1024 + batch 16 的激活约 50 GB，开检查点后降到约 12 GB，
+        # 这是「32 GB 双 T4 上能否装下 1B 训练」的关键。
+        use_ckpt = (
+            grad_checkpoint
+            and self.training
+            and not use_cache
+            and not return_attn
+            and past == 0
+        )
         for i, block in enumerate(self.blocks):
             layer_cache = None if caches is None else caches[i]
-            x, attn_weights, layer_new_cache = block(
-                x, cos, sin, layer_cache, use_cache, return_attn
-            )
+            if use_ckpt:
+                x = torch.utils.checkpoint.checkpoint(
+                    _block_core, block, x, cos, sin, use_reentrant=False
+                )
+                attn_weights, layer_new_cache = None, None
+            else:
+                x, attn_weights, layer_new_cache = block(
+                    x, cos, sin, layer_cache, use_cache, return_attn
+                )
             if use_cache:
                 new_caches.append(layer_new_cache)
             if return_attn and attn_weights is not None:

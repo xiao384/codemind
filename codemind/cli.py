@@ -141,6 +141,8 @@ def _add_train(sub) -> None:
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--grad-accum", type=int, default=1)
+    p.add_argument("--grad-checkpoint", action="store_true",
+                   help="梯度检查点：用计算换显存（1B 在 32GB 双 T4 上必需）")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--min-lr-ratio", type=float, default=0.1)
     # ⚠️ help 里的 `%` 必须写成 `%%`：argparse 会对 help 字符串做 `%` 插值，
@@ -611,6 +613,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         out_dir=args.run,
         batch_size=args.batch_size,
         grad_accum=args.grad_accum,
+        grad_checkpoint=bool(args.grad_checkpoint),
         max_iters=args.steps,
         warmup_iters=args.warmup,
         lr=args.lr,

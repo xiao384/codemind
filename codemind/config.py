@@ -127,6 +127,12 @@ class TrainConfig:
     out_dir: str = "runs/tiny"
     batch_size: int = 16
     grad_accum: int = 1
+    #: 梯度检查点：用计算换显存。
+    #:
+    #: 实测意义（2026-11）：1B + ctx 1024 + batch 16 的激活约 50 GB，
+    #: 开启后降到约 12 GB —— 这是「32 GB 双 T4 上能否装下 1B 训练」的决定性开关。
+    #: 代价约 30% 速度；只在显存紧张时开，AMD 192 GB 上没必要。
+    grad_checkpoint: bool = False
     max_iters: int = 2000
     # 0 表示由 max_iters 推导（取 3% 作为 warmup）。
     #

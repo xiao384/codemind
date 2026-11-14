@@ -284,7 +284,8 @@ def train(
             with _autocast(device, amp_dtype):
                 # logits_for_all=False：训练只要 loss，不算全量 (B,T,V) logits。
                 # 这是 CPU 训练最关键的省内存开关（见 GPT.forward 的说明）。
-                _, loss, _ = model(x, y, loss_mask=mask, logits_for_all=False)
+                _, loss, _ = model(x, y, loss_mask=mask, logits_for_all=False,
+                                  grad_checkpoint=bool(train_cfg.grad_checkpoint))
                 assert loss is not None
                 loss = loss / train_cfg.grad_accum
             if use_scaler:
@@ -459,7 +460,8 @@ def evaluate(
         if mask is not None:
             mask = mask.to(device)
         with _autocast(device, amp_dtype):
-            _, loss, _ = model(x, y, loss_mask=mask, logits_for_all=False)
+            _, loss, _ = model(x, y, loss_mask=mask, logits_for_all=False,
+                                  grad_checkpoint=False)
         if loss is not None:
             total += float(loss)
             count += 1

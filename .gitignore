@@ -62,3 +62,10 @@ nohup.out
 # ═══════════════ IDE ═══════════════
 .idea/
 .vscode/
+
+# SSH 私钥（绝不可提交）
+.ssh/
+*.pem
+*.ppk
+.cm.tmp
+
