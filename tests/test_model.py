@@ -584,3 +584,91 @@ def test_grad_checkpoint_skipped_when_cache_used(cfg: ModelConfig) -> None:
     # KW-Cache 必须真的产出了（n_layer 个），说明没走检查点分支
     caches = aux.get("caches") if isinstance(aux, dict) else None
     assert caches is not None and len(caches) == cfg.n_layer
+
+
+# ═══════════════ 训练稳定性组件（QK-Norm / Z-Loss）═══════════════
+#
+# 动机（都有实测依据）：
+#   * 1B（40层/d1536）用 lr 1e-3 时，best_val 2.0082 停在 step 2,600 后再没刷新，
+#     之后 51,400 步在 3.3 附近挣扎 —— 注意力 logits 幅度失控的典型表现。
+#   * 同一次训练在 step 3,581 出现过 loss 1.80 → 4.84 的尖峰。
+# QK-Norm 与 z-loss 分别针对这两件事。
+
+
+def test_qk_norm_adds_only_per_head_norms(cfg: ModelConfig) -> None:
+    """开启 qk_norm 只应增加每层 2 个 head_dim 的 RMSNorm 参数。"""
+    base = GPT(cfg)
+    cfg_qk = ModelConfig(
+        vocab_size=cfg.vocab_size, n_layer=cfg.n_layer, n_head=cfg.n_head,
+        n_embd=cfg.n_embd, n_kv_head=cfg.n_kv_head, block_size=cfg.block_size,
+        qk_norm=True,
+    )
+    with_qk = GPT(cfg_qk)
+
+    n_base = sum(p.numel() for p in base.parameters())
+    n_qk = sum(p.numel() for p in with_qk.parameters())
+    expected = cfg.n_layer * 2 * cfg.head_dim
+    assert n_qk - n_base == expected, f"{n_qk - n_base} != {expected}"
+
+
+def test_qk_norm_bounds_qk_scale(cfg: ModelConfig) -> None:
+    """QK-Norm 后每个 head 的 q/k 的 RMS 应接近 1（不受输入幅度影响）。
+
+    这是它稳定训练的作用机制：注意力 logits 的尺度被钉住，
+    不会因为上游激活变大而爆炸。
+    """
+    cfg_qk = ModelConfig(
+        vocab_size=cfg.vocab_size, n_layer=1, n_head=cfg.n_head,
+        n_embd=cfg.n_embd, n_kv_head=cfg.n_kv_head, block_size=cfg.block_size,
+        qk_norm=True,
+    )
+    model = GPT(cfg_qk)
+    attn = model.blocks[0].attn
+    x = torch.randn(2, cfg.block_size, cfg.n_embd) * 50.0   # 故意放大输入
+    B, T, _ = x.shape
+    q = attn.q_proj(x).view(B, T, attn.n_head, attn.head_dim).transpose(1, 2)
+    q_normed = attn.q_norm(q)
+    rms = q_normed.pow(2).mean(dim=-1).sqrt()
+    # RMSNorm 的输出 RMS 约等于 1（乘上初始化为 1 的 weight）
+    assert rms.mean().item() == pytest.approx(1.0, abs=0.05)
+
+
+def test_z_loss_increases_loss_by_expected_amount(cfg: ModelConfig) -> None:
+    """z_loss 的增量必须等于 coef * mean(logsumexp(logits)^2)。"""
+    torch.manual_seed(7)
+    model = GPT(cfg)
+    idx = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))
+    tgt = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))
+
+    model.eval()
+    with torch.no_grad():
+        logits, loss0, _ = model(idx, tgt, logits_for_all=True)
+
+        coef = 1e-3
+        cfg_z = ModelConfig(
+            vocab_size=cfg.vocab_size, n_layer=cfg.n_layer, n_head=cfg.n_head,
+            n_embd=cfg.n_embd, n_kv_head=cfg.n_kv_head, block_size=cfg.block_size,
+            z_loss=coef,
+        )
+        model_z = GPT(cfg_z)
+        model_z.load_state_dict(model.state_dict())
+        model_z.eval()
+        _, loss_z, _ = model_z(idx, tgt, logits_for_all=True)
+
+    lse = torch.logsumexp(logits.float(), dim=-1)
+    expected_delta = coef * lse.pow(2).mean()
+    actual_delta = float(loss_z.detach()) - float(loss0.detach())
+    assert actual_delta == pytest.approx(float(expected_delta.detach()), rel=1e-5)
+
+
+def test_z_loss_zero_is_bit_exact(cfg: ModelConfig) -> None:
+    """z_loss=0（默认）必须与加入该功能之前逐位一致 —— 向后兼容的硬要求。"""
+    torch.manual_seed(11)
+    m = GPT(cfg)
+    idx = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))
+    tgt = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))
+    m.eval()
+    with torch.no_grad():
+        _, a, _ = m(idx, tgt, logits_for_all=False)
+        _, b, _ = m(idx, tgt, logits_for_all=False)
+    assert float(a.detach()) == float(b.detach())

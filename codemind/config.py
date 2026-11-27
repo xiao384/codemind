@@ -60,6 +60,22 @@ class ModelConfig:
     # 若不共享，可单独指定输出层偏置（一般不需要）。
     bias: bool = False
 
+    # ── 训练稳定性组件（2026-11 新增）────────────────────────────────
+    #: **QK-Norm**：对每个 head 的 q/k 做 RMSNorm 后再算注意力。
+    #:
+    #: 动机有实测依据：云端 1B（40 层/d1536）用 lr 1e-3 时，验证损失在
+    #: step 2,600 达到 2.0082 后**再也没刷新过**，之后 51,400 步一路在 3.3 附近
+    #: 挣扎 —— 这是注意力 logits 幅度失控的典型表现。QK-Norm 把 q/k 的尺度
+    #: 钉住，是 ViT-22B / Chameleon / OLMo 都用的大模型稳定化手段。
+    #: 代价：每层多 2 个 head_dim 的 RMSNorm，参数量增加 < 0.01%。
+    qk_norm: bool = False
+    #: **Z-Loss 系数**：``loss += coef * mean(logsumexp(logits)^2)``。
+    #:
+    #: 把 logits 的绝对值往 0 拉，抑制 softmax 饱和。1B 那轮在 step 3,581
+    #: 出现过 loss 1.80 → 4.84 的尖峰，z-loss 正是针对这类尖峰的标准手段。
+    #: 常用量级 1e-4；0 表示关闭。
+    z_loss: float = 0.0
+
     def __post_init__(self) -> None:
         if self.n_embd % self.n_head != 0:
             raise ValueError(

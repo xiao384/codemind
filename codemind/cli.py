@@ -141,6 +141,10 @@ def _add_train(sub) -> None:
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--grad-accum", type=int, default=1)
+    p.add_argument("--qk-norm", action="store_true",
+                   help="对每个 head 的 q/k 做 RMSNorm（大模型训练稳定性）")
+    p.add_argument("--z-loss", type=float, default=0.0,
+                   help="z-loss 系数（抑制 logits 幅度/训练尖峰，常用 1e-4）")
     p.add_argument("--grad-checkpoint", action="store_true",
                    help="梯度检查点：用计算换显存（1B 在 32GB 双 T4 上必需）")
     p.add_argument("--lr", type=float, default=1e-3)
@@ -565,6 +569,10 @@ def cmd_train(args: argparse.Namespace) -> int:
     from .train import train
 
     overrides = {}
+    if args.qk_norm:
+        overrides["qk_norm"] = True
+    if args.z_loss:
+        overrides["z_loss"] = args.z_loss
     if args.ctx is not None:
         overrides["block_size"] = args.ctx
     if args.layers is not None:

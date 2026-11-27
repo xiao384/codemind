@@ -116,6 +116,11 @@ class CausalSelfAttention(nn.Module):
         self.v_proj = nn.Linear(cfg.n_embd, cfg.n_kv_head * self.head_dim, bias=cfg.bias)
         self.o_proj = nn.Linear(cfg.n_head * self.head_dim, cfg.n_embd, bias=cfg.bias)
         self.resid_dropout = nn.Dropout(cfg.dropout)
+        # QK-Norm：把每个 head 的 q/k 尺度钉住，防止注意力 logits 爆炸。
+        # 依据见 ModelConfig.qk_norm —— 1B 在 lr 1e-3 下 best_val 停在 step 2600
+        # 再没刷新，是这类不稳定性的直接证据。
+        self.q_norm = RMSNorm(cfg.head_dim, cfg.norm_eps) if cfg.qk_norm else None
+        self.k_norm = RMSNorm(cfg.head_dim, cfg.norm_eps) if cfg.qk_norm else None
 
     def forward(
         self,
@@ -132,6 +137,12 @@ class CausalSelfAttention(nn.Module):
         q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+
+        # QK-Norm 必须在 RoPE **之前**做：先归一化幅度，再旋转位置。
+        # 反过来会把 RoPE 的旋转幅度也归一化掉，位置信息就丢了。
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
@@ -377,6 +388,7 @@ class GPT(nn.Module):
                 targets.reshape(-1),
                 ignore_index=ignore_index,
             )
+            loss = self._add_z_loss(loss, logits)
             return logits, loss, self._pack_aux(use_cache, new_caches, return_attn, attn_maps)
 
         # 掩码路径：只对需要计损的位置做 lm_head —— 这是训练时最省内存的一条路。
@@ -391,10 +403,25 @@ class GPT(nn.Module):
         logits_sel = self.lm_head(x_flat.index_select(0, keep))
         tgt_sel = tgt_flat.index_select(0, keep)
         loss = F.cross_entropy(logits_sel.float(), tgt_sel, ignore_index=ignore_index)
+        loss = self._add_z_loss(loss, logits_sel)
         # 训练不需要 logits 时（默认）直接返回 None，彻底避免再算一遍全量投影
         if logits_for_all:
             return self.lm_head(x), loss, self._pack_aux(use_cache, new_caches, return_attn, attn_maps)
         return None, loss, self._pack_aux(use_cache, new_caches, return_attn, attn_maps)
+
+    def _add_z_loss(self, loss: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        """把 z-loss 加到交叉熵上（``cfg.z_loss == 0`` 时原样返回，零开销）。
+
+        z-loss 惩罚 ``logsumexp(logits)`` 的平方，等价于把 logits 的整体幅度往 0 拉。
+        它不改变最优解（softmax 对常数平移不变），但**显著抑制训练尖峰** ——
+        1B 那轮在 step 3,581 出现 loss 1.80 → 4.84 的尖峰，正是这类现象。
+        """
+        coef = getattr(self.cfg, "z_loss", 0.0)
+        if not coef:
+            return loss
+        # logsumexp 在 fp32 下算，避免 bf16 下 exp 溢出
+        lse = torch.logsumexp(logits.float(), dim=-1)
+        return loss + coef * lse.pow(2).mean()
 
     @staticmethod
     def _pack_aux(use_cache: bool, caches, return_attn: bool, attn_maps) -> Dict[str, object]:
