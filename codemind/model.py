@@ -156,23 +156,44 @@ class CausalSelfAttention(nn.Module):
             new_cache = (k, v)
 
         t_k = k.shape[2]
-        # 扩展 KV 头以匹配 Q 头（GQA）：先在 head 维复制，避免 materialize 整个 KV
-        if self.n_rep > 1:
-            k_full = k.repeat_interleave(self.n_rep, dim=1)
-            v_full = v.repeat_interleave(self.n_rep, dim=1)
-        else:
-            k_full, v_full = k, v
-
         # SDPA 的融合实现不会返回注意力权重，因此仅在「无缓存且不需要权重」时使用它。
         # 其余情况走手写路径：长度可不等（增量解码），权重可导出（可解释性/调试）。
+        #
+        # ⚠️ GQA 的两种展开方式差别很大：
+        #   * 旧做法 `repeat_interleave` 把 K/V **物理复制** n_rep 份 ——
+        #     1B / ctx 1024 / batch 16 下这是 (16, 24, 1024, 64) 的 bf16 张量，
+        #     单层 50 MB、40 层就是 2 GB，而且要多花一次显存写带宽。
+        #   * `enable_gqa=True` 让 SDPA 内核**直接按 n_rep 广播**，不产生副本。
+        #     这是纯收益：显存更省、速度更快、数值等价。
+        # 只有走手写路径（需要 attn_weights 或 cache）时才不得不展开。
         if cache is None and not return_attn:
-            ctx = F.scaled_dot_product_attention(
-                q, k_full, v_full,
-                dropout_p=self.attn_dropout if self.training else 0.0,
-                is_causal=True,
-            )
-            attn_weights = None
+            try:
+                ctx = F.scaled_dot_product_attention(
+                    q, k, v,
+                    dropout_p=self.attn_dropout if self.training else 0.0,
+                    is_causal=True,
+                    enable_gqa=self.n_rep > 1,
+                )
+                attn_weights = None
+            except TypeError:
+                # 老版本 PyTorch 没有 enable_gqa：退回物理展开
+                if self.n_rep > 1:
+                    k_full = k.repeat_interleave(self.n_rep, dim=1)
+                    v_full = v.repeat_interleave(self.n_rep, dim=1)
+                else:
+                    k_full, v_full = k, v
+                ctx = F.scaled_dot_product_attention(
+                    q, k_full, v_full,
+                    dropout_p=self.attn_dropout if self.training else 0.0,
+                    is_causal=True,
+                )
+                attn_weights = None
         else:
+            if self.n_rep > 1:
+                k_full = k.repeat_interleave(self.n_rep, dim=1)
+                v_full = v.repeat_interleave(self.n_rep, dim=1)
+            else:
+                k_full, v_full = k, v
             scale = 1.0 / math.sqrt(self.head_dim)
             scores = (q @ k_full.transpose(-2, -1)) * scale
             mask = causal_mask(T, t_k, x.device)

@@ -53,17 +53,53 @@ def _init(old_path: str, new_path: str) -> None:
 
 
 def _one(args: tuple[str, str]) -> tuple[str, int, int, float]:
-    """解码 → 重编码 → 写盘。返回 (文件名, 旧token数, 新token数, 秒)。"""
+    """按 EOT 切分文档 → 逐文档解码 → 重编码 → 补回 EOT → 写盘。
+
+    ## 为什么必须按文档走，而不是整片 decode/encode
+
+    第一版写的是::
+
+        text = old.decode(arr.tolist(), strip_special=True)   # 去掉 EOT
+        ids  = new.encode(text)                               # 新流无边界
+
+    **这把文档边界全剥掉了**，后果有两个，第二个是致命的：
+
+    1. `cb1.py` 靠 ``arr == EOT_ID`` 切文档（`load_documents`），
+       剥掉 EOT 后它找到 0 个文档 → 直接 `StatisticsError: fmean requires
+       at least one data point`（实测踩到）。
+    2. **训练数据里再也没有 EOT** → 模型根本没机会学「什么时候该停」。
+       而「主动收尾」正是我们要测的能力之一。
+
+    正确做法：保留旧流里的 EOT 作为边界，**每个文档单独重编码后再补一个 EOT**。
+    新旧 tokenizer 的 `eot_id` 都是 256（实测），所以边界可以直接沿用数值。
+    """
     src, dst = args
     t0 = time.time()
     arr = np.fromfile(src, dtype=np.uint16)
-    text = _OLD.decode(arr.tolist(), strip_special=True)
-    ids = _NEW.encode(text)
-    # 安全性：确认不越界
-    if ids and max(ids) > 65535:
-        raise ValueError(f"token id 超出 uint16: max={max(ids)}")
-    np.asarray(ids, dtype=np.uint16).tofile(dst)
-    return Path(src).name, len(arr), len(ids), time.time() - t0
+    eot = _OLD.eot_id if _OLD is not None else 256
+
+    # 按 EOT 切出文档区间
+    bounds = np.flatnonzero(arr == eot)
+    out: list[int] = []
+    prev = 0
+    for pos in bounds:
+        if pos > prev:
+            seg = arr[prev:pos].tolist()
+            txt = _OLD.decode(seg, strip_special=True)
+            if txt:
+                out.extend(_NEW.encode(txt))
+            out.append(eot)             # ← 关键：补回文档边界
+        prev = int(pos) + 1
+    if prev < arr.size:                 # 末尾没有 EOT 的残段
+        txt = _OLD.decode(arr[prev:].tolist(), strip_special=True)
+        if txt:
+            out.extend(_NEW.encode(txt))
+        out.append(eot)
+
+    if out and max(out) > 65535:
+        raise ValueError(f"token id 超出 uint16: max={max(out)}")
+    np.asarray(out, dtype=np.uint16).tofile(dst)
+    return Path(src).name, len(arr), len(out), time.time() - t0
 
 
 def collect(d: Path) -> list[Path]:
